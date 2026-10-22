@@ -8,10 +8,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// defaultEmbedTimeout is the per-request embedding HTTP timeout used when
+// EMBED_TIMEOUT_SECONDS is unset or invalid.
+const defaultEmbedTimeout = 30 * time.Second
+
+// embedTimeout resolves the embedding HTTP client timeout from the
+// EMBED_TIMEOUT_SECONDS env var, falling back to defaultEmbedTimeout.
+// A generous value matters for bulk ingest of large documents, where the
+// server chunks and embeds many segments in one upstream call (e.g. the
+// long multi-session haystacks in LongMemEval); 30s is too tight there.
+func embedTimeout() time.Duration {
+	if v := os.Getenv("EMBED_TIMEOUT_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+	}
+	return defaultEmbedTimeout
+}
 
 // Client calls a /v1/embeddings endpoint and returns float32 vectors.
 type Client struct {
@@ -28,7 +48,7 @@ func NewClient(apiURL, apiKey, model string, dim int) *Client {
 		apiKey: apiKey,
 		model:  model,
 		dim:    dim,
-		http:   &http.Client{Timeout: 30 * time.Second},
+		http:   &http.Client{Timeout: embedTimeout()},
 	}
 }
 
