@@ -26,6 +26,9 @@ On top of that, it builds connections between memories:
 - **Knowledge graph** — facts with time (what was true, and when).
 - **Entity graph** — people, things, and how they relate.
 - **Tunnels** — links between related memories.
+- **Room hygiene** *(opt-in)* — merge/rename rooms without fragmenting the
+  taxonomy, plus a scheduled "dream" job that proposes near-duplicate merges.
+  See [ROOM_REDIRECTS.md](./ROOM_REDIRECTS.md).
 
 Agents use all of this through ready-made MCP tools (search, add, recall,
 traverse, and more).
@@ -99,7 +102,8 @@ ollama serve
 Open `docker-compose.yml` and set `EMBED_API_URL`.
 
 - Ollama runs on your host machine → use `http://host.docker.internal:11434/v1`
-  (macOS / Windows). On Linux, use your host IP.
+  (works on macOS, Windows *and* Linux — the compose file maps
+  `host.docker.internal` to the host gateway for you).
 - Ollama runs somewhere else → use that address.
 
 While you're there, **change `MCP_API_KEY`** to your own secret.
@@ -288,7 +292,62 @@ All settings come from environment variables.
 | `MEMPALACE_TENANT_ID` | Keeps data separate per tenant | `default` |
 | `MEMPALACE_HNSW_EF_SEARCH` | Search quality (higher = better, slower) | `100` |
 | `ENABLE_REST_API` | Turn on the optional REST/JSON API (see below) | `false` |
+| `MEMPALACE_GRAPH_AUTO_POPULATE` | Auto-populate the entity graph on `add_drawer` (see below) | `false` |
+| `MEMPALACE_GRAPH_EXTRACTOR` | Extraction strategy: `structural` or `llm` | `structural` |
+| `MEMPALACE_ROOM_REDIRECTS` | Enable room merge/rename redirects (see below) | `false` |
+| `LLM_PROVIDER` | Chat dialect for the `llm` extractor: `openai` or `ollama` (see below) | `openai` |
+| `LLM_API_URL` | Chat API base (only for `llm` extractor) — `openai`: incl. `/v1`; `ollama`: root without `/v1` | empty |
+| `LLM_API_KEY` | API key for the chat API (if needed) | empty |
+| `LLM_MODEL` | Chat model name (only for `llm` extractor) | empty |
 | `PORT` | Port the server listens on | `8000` |
+
+### Knowledge-graph auto-population
+
+By default, `add_drawer` is **storage-only**: it stores the memory (vector +
+metadata) and does **not** touch the Apache AGE entity graph. The graph is
+populated only by explicit `kg_add_entity` / `kg_add_relation` calls. This is a
+deliberate design choice — extraction is the client's job, which keeps the
+write path deterministic and free of LLM calls.
+
+If you *do* want the graph filled automatically, set
+`MEMPALACE_GRAPH_AUTO_POPULATE=true` and pick a strategy:
+
+- **`structural`** (default, no LLM) — deterministic. Every drawer becomes a
+  graph node linked to its room and wing:
+  `(Drawer) -[:IN_ROOM]-> (Room) -[:PART_OF]-> (Wing)`. These nodes carry the
+  `entity_type` `Drawer` / `Room` / `Wing`, so they stay distinguishable from
+  entities you add yourself. No network calls, no new dependencies.
+- **`llm`** — extracts real entities and relations from the drawer content via
+  a chat model. Set `LLM_API_URL`, `LLM_MODEL` (and `LLM_API_KEY` if required).
+  Closer to what MemPalace-family users may expect, at the cost of an LLM call in
+  the `add_drawer` write path. Pick the endpoint dialect with `LLM_PROVIDER`:
+    - **`openai`** (default) — OpenAI-compatible `/v1/chat/completions` (OpenAI,
+      LM Studio, LocalAI, Ollama's compat layer). Point `LLM_API_URL` at the base
+      **including** `/v1` (e.g. `http://host:11434/v1`). ⚠️ **Use a non-thinking
+      model here** — this endpoint cannot suppress a reasoning model's `<think>`
+      output, which streams for tens of seconds and exceeds the extraction
+      timeout, leaving the graph empty.
+    - **`ollama`** — Ollama-native `/api/chat` with `think=false`, which disables
+      reasoning so **thinking models (qwen3, …) work**. Point `LLM_API_URL` at the
+      Ollama root **without** `/v1` (e.g. `http://host:11434`).
+
+Both require Apache AGE to be available; if it isn't, auto-population is
+silently disabled (a log line explains why). Population is **best-effort** — if
+extraction fails, the drawer is still filed; the graph write is just skipped and
+logged. Re-filing the same content is idempotent (graph MERGE), matching
+`add_drawer`'s existing idempotency.
+
+### Room redirects
+
+Off by default. Set `MEMPALACE_ROOM_REDIRECTS=true` to merge or rename rooms
+without fragmenting the taxonomy: an old room forwards to a canonical one, its
+drawers move with a pure metadata update (no re-embedding), and `add_drawer` /
+`mempalace_search` / `mempalace_list_drawers` transparently follow the redirect
+and echo where they landed. When the flag is off the feature is fully absent —
+the redirect tools are not registered and drawer/search behavior is unchanged.
+
+See **[ROOM_REDIRECTS.md](./ROOM_REDIRECTS.md)** for the tool list and a concrete
+`Auth → Authentication` merge walkthrough.
 
 ### A note on `EMBED_DIM`
 
@@ -318,6 +377,26 @@ go run ./cmd/mempalace
 ```
 
 The server creates all the tables it needs on first start.
+
+### Project layout
+
+The repo is a Go workspace (`go.work`) of three modules:
+
+- **`core/`** (`mempalace/core`) — shared library: storage, embedding client,
+  config, and the `consolidate` clustering logic.
+- **`server/`** (`mempalace/server`) — the MCP/HTTP server (imports `core`).
+- **`dreamjob/`** (`mempalace/dreamjob`) — the standalone room-consolidation job
+  (imports `core`), run as a Kubernetes CronJob. See
+  [ROOM_REDIRECTS.md](./ROOM_REDIRECTS.md).
+
+Run the dream job against the same database once:
+
+```bash
+cd dreamjob
+export MEMPALACE_DB_URL="postgres://user:pass@localhost:5432/mempalace"
+export EMBED_API_URL="http://localhost:11434/v1" EMBED_MODEL="embeddinggemma" EMBED_DIM="768"
+go run .
+```
 
 ---
 
