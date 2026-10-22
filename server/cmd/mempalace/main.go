@@ -10,15 +10,18 @@ import (
 	"syscall"
 	"time"
 
+	"mempalace/core/config"
+	"mempalace/core/embed"
+	"mempalace/core/storage"
 	"mempalace/server/internal/auth"
-	"mempalace/server/internal/config"
-	"mempalace/server/internal/embed"
 	"mempalace/server/internal/handler"
-	"mempalace/server/internal/storage"
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("failed to load configuration: %v", err)
+	}
 
 	if cfg.DatabaseURL == "" {
 		log.Fatal("MEMPALACE_DB_URL is required")
@@ -64,6 +67,24 @@ func main() {
 	tunnels := storage.NewTunnelStore(pool, cfg.TenantID)
 	settings := storage.NewSettingsStore(pool, cfg.TenantID)
 
+	// Room redirects are opt-in (MEMPALACE_ROOM_REDIRECTS). When off, both stores
+	// stay nil: no redirect/merge tools are exposed and resolveRoom is a no-op.
+	// The merge-candidate table is shared with the dreamjob microservice, which
+	// provisions it independently.
+	var redirects *storage.RedirectStore
+	var mergeCandidates *storage.MergeCandidateStore
+	if cfg.RoomRedirects {
+		if err := storage.ProvisionRedirects(ctx, pool, cfg.TenantID); err != nil {
+			log.Fatalf("provision room redirects: %v", err)
+		}
+		if err := storage.ProvisionMergeCandidates(ctx, pool, cfg.TenantID); err != nil {
+			log.Fatalf("provision merge candidates: %v", err)
+		}
+		redirects = storage.NewRedirectStore(pool, cfg.TenantID)
+		mergeCandidates = storage.NewMergeCandidateStore(pool, cfg.TenantID)
+		log.Printf("room redirects enabled")
+	}
+
 	// --- Entity-graph (Apache AGE) ---
 	// Best-effort: if AGE is not installed the server still starts,
 	// and the AGE-backed entity tools return a clear error message instead.
@@ -79,7 +100,7 @@ func main() {
 
 	// --- HTTP server ---
 	mux := http.NewServeMux()
-	h := handler.New(col, graph, triples, tunnels, settings, embedClient, cfg)
+	h := handler.New(col, graph, triples, tunnels, redirects, mergeCandidates, settings, embedClient, cfg)
 	h.Register(mux)
 
 	// Optional plain REST/JSON API (off unless ENABLE_REST_API=true).
